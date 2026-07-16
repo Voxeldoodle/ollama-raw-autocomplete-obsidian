@@ -1,0 +1,10 @@
+{
+  "id": "ollama-raw-autocomplete",
+  "name": "Ollama Raw Autocomplete",
+  "version": "1.0.0",
+  "minAppVersion": "1.1.0",
+  "description": "Copilot-style ghost-text autocomplete for prose, powered by Ollama's raw /api/generate endpoint (no chat template).",
+  "author": "you",
+  "authorUrl": "",
+  "isDesktopOnly": false
+}

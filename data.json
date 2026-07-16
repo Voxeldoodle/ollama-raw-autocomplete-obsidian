@@ -1,0 +1,11 @@
+{
+  "ollamaUrl": "http://localhost:11434",
+  "model": "mistral:7b",
+  "triggerDelayMs": 500,
+  "prefixChars": 2000,
+  "maxTokens": 40,
+  "temperature": 0.4,
+  "rawMode": true,
+  "minTriggerChars": 3,
+  "enabled": true
+}
