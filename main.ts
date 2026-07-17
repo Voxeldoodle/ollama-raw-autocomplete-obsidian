@@ -19,6 +19,8 @@ interface OllamaAutocompleteSettings {
 	triggerDelayMs: number;
 	prefixChars: number;
 	maxTokens: number;
+	maxGhostTextChars: number;
+	ghostTextChunkSize: number;
 	temperature: number;
 	rawMode: boolean; // true = bypass model template entirely (pure text continuation)
 	minTriggerChars: number; // don't trigger on very short lines
@@ -31,6 +33,8 @@ const DEFAULT_SETTINGS: OllamaAutocompleteSettings = {
 	triggerDelayMs: 500,
 	prefixChars: 2000,
 	maxTokens: 40,
+	maxGhostTextChars: 240,
+	ghostTextChunkSize: 80,
 	temperature: 0.4,
 	rawMode: true,
 	minTriggerChars: 3,
@@ -39,8 +43,14 @@ const DEFAULT_SETTINGS: OllamaAutocompleteSettings = {
 
 // ---------- CodeMirror: ghost text suggestion state ----------
 
+interface GhostTextSuggestion {
+	pos: number;
+	segments: string[];
+	index: number;
+}
+
 // The effect used to push a new suggestion (or clear one, via null) into the editor state.
-const setSuggestion = StateEffect.define<{ text: string; pos: number } | null>();
+const setSuggestion = StateEffect.define<GhostTextSuggestion | null>();
 
 class GhostTextWidget extends WidgetType {
 	constructor(readonly text: string) {
@@ -60,7 +70,7 @@ class GhostTextWidget extends WidgetType {
 	}
 }
 
-const suggestionField = StateField.define<{ text: string; pos: number } | null>({
+const suggestionField = StateField.define<GhostTextSuggestion | null>({
 	create() {
 		return null;
 	},
@@ -80,20 +90,45 @@ const suggestionField = StateField.define<{ text: string; pos: number } | null>(
 	},
 	provide: (field) =>
 		EditorView.decorations.from(field, (value) => {
-			if (!value || !value.text) return Decoration.none;
+			if (!value) return Decoration.none;
+			const currentText = value.segments[value.index] ?? "";
+			if (!currentText) return Decoration.none;
 			return Decoration.set([
-				Decoration.widget({ widget: new GhostTextWidget(value.text), side: 1 }).range(value.pos),
+				Decoration.widget({ widget: new GhostTextWidget(currentText), side: 1 }).range(value.pos),
 			]);
 		}),
 });
 
+function limitSuggestionText(text: string, maxChars: number): string {
+	if (maxChars <= 0 || text.length <= maxChars) return text;
+	return text.slice(0, maxChars);
+}
+
+function splitSuggestionIntoChunks(text: string, chunkSize: number): string[] {
+	if (!text) return [];
+	if (chunkSize <= 0 || text.length <= chunkSize) return [text];
+	const segments: string[] = [];
+	for (let index = 0; index < text.length; index += chunkSize) {
+		segments.push(text.slice(index, index + chunkSize));
+	}
+	return segments;
+}
+
 function acceptSuggestion(view: EditorView): boolean {
 	const value = view.state.field(suggestionField, false);
-	if (!value || !value.text) return false;
+	if (!value) return false;
+	const currentText = value.segments[value.index] ?? "";
+	if (!currentText) return false;
+
+	const nextSegments = value.segments.slice(value.index + 1);
+	const nextSuggestion = nextSegments.length
+		? { pos: value.pos + currentText.length, segments: nextSegments, index: 0 }
+		: null;
+
 	view.dispatch({
-		changes: { from: value.pos, insert: value.text },
-		selection: { anchor: value.pos + value.text.length },
-		effects: setSuggestion.of(null),
+		changes: { from: value.pos, insert: currentText },
+		selection: { anchor: value.pos + currentText.length },
+		effects: setSuggestion.of(nextSuggestion),
 	});
 	return true;
 }
@@ -140,6 +175,8 @@ export default class OllamaAutocompletePlugin extends Plugin {
 			},
 		});
 
+		const plugin = this;
+
 		// The CodeMirror 6 extension: just the state field for the ghost-text
 		// decoration plus a high-precedence keymap for Tab (accept) / Escape
 		// (dismiss). Scheduling new requests is handled separately below via
@@ -151,7 +188,11 @@ export default class OllamaAutocompletePlugin extends Plugin {
 				keymap.of([
 					{
 						key: "Tab",
-						run: (view) => acceptSuggestion(view),
+						run: (view) => {
+							const value = view.state.field(suggestionField, false);
+							if (value) return acceptSuggestion(view);
+							return false;
+						},
 					},
 					{
 						key: "Escape",
@@ -228,7 +269,13 @@ export default class OllamaAutocompletePlugin extends Plugin {
 		const freshPos = freshCm.state.selection.main.head;
 		if (freshPos !== pos) return; // cursor moved since we asked
 
-		freshCm.dispatch({ effects: setSuggestion.of({ text: completion, pos: freshPos }) });
+		const limitedCompletion = limitSuggestionText(completion, this.settings.maxGhostTextChars);
+		const segments = splitSuggestionIntoChunks(limitedCompletion, this.settings.ghostTextChunkSize);
+		if (!segments.length) return;
+
+		freshCm.dispatch({
+			effects: setSuggestion.of({ pos: freshPos, segments, index: 0 }),
+		});
 	}
 
 	async callOllama(prefix: string): Promise<string> {
@@ -368,6 +415,34 @@ class OllamaAutocompleteSettingTab extends PluginSettingTab {
 					.setDynamicTooltip()
 					.onChange(async (v) => {
 						this.plugin.settings.maxTokens = v;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Max ghost text (chars)")
+			.setDesc("Cap how much text is shown in a single suggestion.")
+			.addSlider((s) =>
+				s
+					.setLimits(40, 800, 20)
+					.setValue(this.plugin.settings.maxGhostTextChars)
+					.setDynamicTooltip()
+					.onChange(async (v) => {
+						this.plugin.settings.maxGhostTextChars = v;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Ghost text chunk size")
+			.setDesc("How many characters are inserted per Tab press.")
+			.addSlider((s) =>
+				s
+					.setLimits(20, 200, 10)
+					.setValue(this.plugin.settings.ghostTextChunkSize)
+					.setDynamicTooltip()
+					.onChange(async (v) => {
+						this.plugin.settings.ghostTextChunkSize = v;
 						await this.plugin.saveSettings();
 					})
 			);
