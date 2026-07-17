@@ -4,8 +4,11 @@
   "triggerDelayMs": 500,
   "prefixChars": 2000,
   "maxTokens": 40,
+  "maxGhostTextChars": 240,
+  "ghostTextChunkSize": 80,
   "temperature": 0.4,
   "rawMode": true,
   "minTriggerChars": 3,
+  "triggerMode": "manual",
   "enabled": true
 }

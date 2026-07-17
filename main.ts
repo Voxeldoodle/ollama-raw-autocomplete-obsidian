@@ -13,6 +13,8 @@ import { StateField, StateEffect, Prec } from "@codemirror/state";
 
 // ---------- Settings ----------
 
+type TriggerMode = "auto" | "manual" | "both";
+
 interface OllamaAutocompleteSettings {
 	ollamaUrl: string;
 	model: string;
@@ -24,6 +26,7 @@ interface OllamaAutocompleteSettings {
 	temperature: number;
 	rawMode: boolean; // true = bypass model template entirely (pure text continuation)
 	minTriggerChars: number; // don't trigger on very short lines
+	triggerMode: TriggerMode;
 	enabled: boolean;
 }
 
@@ -38,6 +41,7 @@ const DEFAULT_SETTINGS: OllamaAutocompleteSettings = {
 	temperature: 0.4,
 	rawMode: true,
 	minTriggerChars: 3,
+	triggerMode: "both",
 	enabled: true,
 };
 
@@ -107,10 +111,45 @@ function limitSuggestionText(text: string, maxChars: number): string {
 function splitSuggestionIntoChunks(text: string, chunkSize: number): string[] {
 	if (!text) return [];
 	if (chunkSize <= 0 || text.length <= chunkSize) return [text];
+
 	const segments: string[] = [];
-	for (let index = 0; index < text.length; index += chunkSize) {
-		segments.push(text.slice(index, index + chunkSize));
+	let cursor = 0;
+
+	while (cursor < text.length) {
+		const maxEnd = Math.min(text.length, cursor + chunkSize);
+		let end = maxEnd;
+
+		const window = text.slice(cursor, maxEnd);
+		const sentenceBreak = window.search(/[.!?](?:\s|$)/);
+		if (sentenceBreak !== -1) {
+			end = cursor + sentenceBreak + 1;
+		} else {
+			const newlineBreak = window.lastIndexOf("\n");
+			if (newlineBreak > 0) {
+				end = cursor + newlineBreak;
+			} else {
+				const whitespaceBreak = window.lastIndexOf(" ");
+				if (whitespaceBreak > 0) {
+					end = cursor + whitespaceBreak;
+				}
+			}
+		}
+
+		if (end <= cursor) {
+			end = maxEnd;
+		}
+
+		const segment = text.slice(cursor, end);
+		if (segment) {
+			segments.push(segment);
+		}
+
+		cursor = end;
+		while (cursor < text.length && /\s/.test(text[cursor])) {
+			cursor += 1;
+		}
 	}
+
 	return segments;
 }
 
@@ -175,13 +214,11 @@ export default class OllamaAutocompletePlugin extends Plugin {
 			},
 		});
 
-		const plugin = this;
-
 		// The CodeMirror 6 extension: just the state field for the ghost-text
 		// decoration plus a high-precedence keymap for Tab (accept) / Escape
 		// (dismiss). Scheduling new requests is handled separately below via
-		// a DOM-level keyup listener, which is simpler and avoids fighting
-		// over plugin-instance access inside a ViewPlugin.
+		// a DOM-level listener, which is simpler and avoids fighting over
+		// plugin-instance access inside a ViewPlugin.
 		this.registerEditorExtension([
 			suggestionField,
 			Prec.highest(
@@ -202,8 +239,20 @@ export default class OllamaAutocompletePlugin extends Plugin {
 			),
 		]);
 
+		this.registerDomEvent(document, "keydown", (evt: KeyboardEvent) => {
+			if (!this.settings.enabled) return;
+			if (this.settings.triggerMode === "auto") return;
+			if ((evt.ctrlKey || evt.metaKey) && evt.code === "Space") {
+				evt.preventDefault();
+				evt.stopPropagation();
+				this.requestSuggestionForActiveEditor();
+			}
+		});
+
 		this.registerDomEvent(document, "keyup", (evt: KeyboardEvent) => {
 			if (!this.settings.enabled) return;
+			if (this.settings.triggerMode === "manual") return;
+			if ((evt.ctrlKey || evt.metaKey) && evt.code === "Space") return;
 			if (["Tab", "Escape", "Shift", "Control", "Alt", "Meta"].includes(evt.key)) return;
 			this.scheduleSuggestionFromDom();
 		});
@@ -222,6 +271,13 @@ export default class OllamaAutocompletePlugin extends Plugin {
 		this.debounceTimer = window.setTimeout(() => {
 			this.requestSuggestionForActiveEditor();
 		}, this.settings.triggerDelayMs);
+	}
+
+	private shouldTriggerAutomatically(evt: KeyboardEvent): boolean {
+		if (!this.settings.enabled) return false;
+		if (this.settings.triggerMode === "manual") return false;
+		if ((evt.ctrlKey || evt.metaKey) && evt.code === "Space") return false;
+		return true;
 	}
 
 	private getActiveCM(): EditorView | null {
@@ -376,6 +432,21 @@ class OllamaAutocompleteSettingTab extends PluginSettingTab {
 					this.plugin.settings.rawMode = v;
 					await this.plugin.saveSettings();
 				})
+			);
+
+		new Setting(containerEl)
+			.setName("Trigger mode")
+			.setDesc("Choose between automatic suggestions, Ctrl/Cmd+Space, or both.")
+			.addDropdown((d) =>
+				d
+					.addOption("auto", "Auto")
+					.addOption("manual", "Ctrl/Cmd+Space")
+					.addOption("both", "Auto + Ctrl/Cmd+Space")
+					.setValue(this.plugin.settings.triggerMode)
+					.onChange(async (value: TriggerMode) => {
+						this.plugin.settings.triggerMode = value;
+						await this.plugin.saveSettings();
+					})
 			);
 
 		new Setting(containerEl)
